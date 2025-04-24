@@ -1,0 +1,1248 @@
+#PLEASE RUN EVERYTHING IN ORDER, MAKE SURE EVERYTHING'S RUN WELL
+rm(list = ls())  # clear environment
+
+#installing packages
+packages <- c("actuar", "MASS", "dplyr", "fitdistrplus","ggplot2","reshape2","pscl","ADGofTest")
+
+#install.packages("kSamples") PLEASE INSTALL MISSING PACKAGES
+
+lapply(packages, require, character.only = TRUE)
+
+
+#==================== DATA LOAD AND SPLITS ====================================================================================
+
+#PLEASE CHANGE THE DATA LOCATION
+data <- read.csv("CHANGE", header = TRUE, stringsAsFactors = TRUE)
+
+#data splitting function
+extract_subclass_vars <- function(data, class_prefix, class_name, subclasses) {
+  class_data <- data %>% filter(class == class_name)
+  
+  #size (non-zero freq)
+  assign(paste0(class_prefix, "_size"),
+         class_data %>%
+           filter(freq != 0) %>%
+           pull(marketloss),
+         envir = .GlobalEnv)
+  
+  #frequency
+  assign(paste0(class_prefix, "_freq"),
+         class_data %>%
+           distinct(pid, .keep_all = TRUE) %>%
+           select(duration, freq),
+         envir = .GlobalEnv)
+  
+  #risk share
+  assign(paste0(class_prefix, "_rs"),
+         class_data %>%
+           distinct(pid, .keep_all = TRUE) %>%
+           pull(share),
+         envir = .GlobalEnv)
+  
+  #subclasses split
+  for (sub in subclasses) {
+    safe_sub <- gsub(" ", "_", tolower(sub))  # handle spaces
+    prefix <- paste0(class_prefix, "_", safe_sub)
+    
+    #size (non-zero freq)
+    assign(paste0(prefix, "_size"),
+           class_data %>%
+             filter(subclass == sub, freq != 0) %>%
+             pull(marketloss),
+           envir = .GlobalEnv)
+    
+    #frequency
+    assign(paste0(prefix, "_freq"),
+           class_data %>%
+             filter(subclass == sub) %>%
+             distinct(pid, .keep_all = TRUE) %>%
+             select(duration, freq),
+           envir = .GlobalEnv)
+    
+    #risk share
+    assign(paste0(prefix, "_rs"),
+           class_data %>%
+             filter(subclass == sub) %>%
+             distinct(pid, .keep_all = TRUE) %>%
+             pull(share),
+           envir = .GlobalEnv)
+    
+  }
+}
+
+#extract splits
+extract_subclass_vars(data, "ah", "Aviation Hull", c("Main", "Deductible"))
+extract_subclass_vars(data, "mh", "Marine Hull", c("Main", "IV"))
+
+
+#descriptive summary function
+summarise_subclass <- function(data, class_name) {
+  summary_table <- data %>%
+    filter(class == class_name) %>%
+    group_by(subclass) %>%
+    summarise(
+      tot_policy = n_distinct(pid),
+      n_policy = n_distinct(pid[freq != 0]),
+      noclaim_pol = 1 - (n_policy / tot_policy),
+      
+      n_claim = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name) %>%
+          distinct(pid, .keep_all = TRUE) %>%
+          filter(freq > 0) %>%
+          summarise(sum(freq, na.rm = TRUE)) %>%
+          pull()
+      },
+      
+      avg_size = mean(marketloss[freq != 0], na.rm = TRUE),
+      sd_size = round(sd(marketloss[freq != 0], na.rm = TRUE), 0),  # No decimals
+      
+      freq_avg = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name, freq != 0) %>%
+          group_by(pid) %>%
+          summarise(avg_freq = mean(freq, na.rm = TRUE), .groups = "drop") %>%
+          summarise(mean(avg_freq, na.rm = TRUE)) %>%
+          pull()
+      },
+      freq_var = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name) %>%
+          distinct(pid, .keep_all = TRUE) %>%
+          mutate(std_freq = freq / duration) %>%
+          summarise(var(std_freq, na.rm = TRUE)) %>%
+          pull()
+      },
+      `PR%` = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name) %>%
+          summarise(round(mean(PrXs == "Primary", na.rm = TRUE) * 100, 2)) %>%
+          pull()
+      },
+      
+      `XS%` = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name) %>%
+          summarise(round(mean(PrXs == "Excess", na.rm = TRUE) * 100, 2)) %>%
+          pull()
+      },
+      
+
+      
+      `full_rs%` = {
+        subclass_name <- cur_group()$subclass
+        data %>%
+          filter(class == class_name, subclass == subclass_name) %>%
+          group_by(pid) %>%
+          summarise(avg_share = mean(share, na.rm = TRUE), .groups = "drop") %>%
+          summarise(mean(avg_share == 1, na.rm = TRUE)) %>%
+          pull() * 100
+      }
+    )
+  
+  print(paste("Summary for class:", class_name))
+  print(summary_table)
+  invisible(summary_table)
+}
+
+#producing descriptive summary table
+ah_summary <- summarise_subclass(data, "Aviation Hull")
+mh_summary <- summarise_subclass(data, "Marine Hull")
+
+#inputs for model fittings (in list)
+size_list <- list(
+  ah_main_size = "Aviation Hull - Main",
+  ah_deductible_size = "Aviation Hull - Deductible",
+  mh_main_size = "Marine Hull - Main",
+  mh_iv_size = "Marine Hull - IV"
+)
+
+freq_list <- list(
+  ah_main_freq = "Aviation Hull - Main",
+  ah_deductible_freq = "Aviation Hull - Deductible",
+  mh_main_freq = "Marine Hull - Main",
+  mh_iv_freq = "Marine Hull - IV"
+)
+
+rs_list <- list(
+  ah_main_rs = "Aviation Hull - Main",
+  ah_deductible_rs = "Aviation Hull - Deductible",
+  mh_main_rs = "Marine Hull - Main",
+  mh_iv_rs = "Marine Hull - IV"
+)
+#==================== CLAIM SEVERITY FITTINGS=======================================
+
+#severity model fitting function
+view_fits_interactive <- function(data_list) {
+  #dummy df for saving each estimated parameters in each subclass
+  winner_params_df <- data.frame(
+    Class = character(),
+    Distribution = character(),
+    Param1_Name = character(),
+    Param1_Value = numeric(),
+    Param2_Name = character(),
+    Param2_Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  #dummy df for saving each estimated parameters in each subclass (only lognormals)
+  lognormal_params_df <- data.frame(
+    Class = character(),
+    meanlog = numeric(),
+    sdlog = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+for (var_name in names(data_list)) {
+    label <- data_list[[var_name]]
+    cat("\n=== Now processing:", label, "===\n")
+    x <- get(var_name, envir = parent.frame())
+    n <- length(x)
+    q <- ppoints(n)
+    data_sorted <- sort(x)
+    
+    #distribution fittings
+    fit_lnorm <- fitdist(x, "lnorm")
+    fit_gamma <- fitdist(x, "gamma")
+    fit_pareto <- fitdist(x, "pareto", start = list(shape = 2, scale = 1))
+    
+    lognormal_params_df <- rbind(lognormal_params_df, data.frame(
+      Class = label,
+      meanlog = round(fit_lnorm$estimate["meanlog"], 4),
+      sdlog = round(fit_lnorm$estimate["sdlog"], 4),
+      stringsAsFactors = FALSE
+    ))
+    
+    dist_names <- c("Lognormal", "Gamma", "Pareto")
+    
+    #QQ plot
+    theoretical_list <- list(
+      qlnorm(q, fit_lnorm$estimate["meanlog"], fit_lnorm$estimate["sdlog"]),
+      qgamma(q, fit_gamma$estimate["shape"], fit_gamma$estimate["rate"]),
+      qpareto(q, fit_pareto$estimate["shape"], fit_pareto$estimate["scale"])
+    )
+    
+    dist_names <- c("Lognormal", "Gamma", "Pareto")
+    qq_data <- data.frame(
+      Observed = rep(data_sorted, length(dist_names)),
+      Theoretical = unlist(theoretical_list),
+      Distribution = rep(dist_names, each = n)
+    )
+    
+    p_qq <- ggplot(qq_data, aes(x = Theoretical, y = Observed)) +
+      geom_point(alpha = 0.5) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+      facet_wrap(~Distribution, scales = "free") +
+      scale_x_log10() + scale_y_log10() +
+      labs(title = paste("QQ Plot (Log Scale) -", label),
+           x = "Theoretical Quantiles", y = "Observed Quantiles") +
+      theme_minimal(base_size = 14)
+    qq_data <- data.frame(
+      Observed = rep(data_sorted, length(dist_names)),
+      Theoretical = unlist(theoretical_list),
+      Distribution = rep(dist_names, each = n)
+    )
+    
+    p_qq <- ggplot(qq_data, aes(x = Theoretical, y = Observed)) +
+      geom_point(alpha = 0.5) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+      facet_wrap(~Distribution, scales = "free") +
+      scale_x_log10() + scale_y_log10() +
+      labs(title = paste("QQ Plot (Log Scale) -", label),
+           x = "Theoretical Quantiles", y = "Observed Quantiles") +
+      theme_minimal(base_size = 14)
+    
+    print(p_qq)
+    
+    #empirical vs theretical cdfs plot
+    ecdf_vals <- ecdf(x)(data_sorted)
+    cdf_lnorm <- plnorm(data_sorted, meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"])
+    cdf_gamma <- pgamma(data_sorted, shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"])
+    cdf_pareto <- ppareto(data_sorted, shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"])
+    
+    readline("\n[Press ENTER for Gamma CDF plots...]")
+    #gamma plot
+    print(
+      ggplot(data.frame(x = data_sorted, Empirical = ecdf_vals, Theoretical = cdf_gamma), aes(x = x)) +
+        geom_step(aes(y = Empirical), color = "black", size = 1, alpha = 0.7) +
+        geom_line(aes(y = Theoretical), color = "red", size = 1) +
+        scale_x_log10() +
+        labs(title = paste("Empirical vs Gamma CDF -", label), x = "Claim Severity (log scale)", y = "CDF") +
+        theme_minimal(base_size = 14)
+    )
+    readline("\n[Press ENTER for Lognormal & Pareto CDF plots...]")
+    
+    #lognormal and pareto plot
+    cdf_data_lp <- data.frame(
+      x = rep(data_sorted, 2),
+      Empirical = rep(ecdf_vals, 2),
+      Theoretical = c(cdf_lnorm, cdf_pareto),
+      Distribution = rep(c("Lognormal", "Pareto"), each = n)
+    )
+    
+    p_lp <- ggplot(cdf_data_lp, aes(x = x)) +
+      geom_step(aes(y = Empirical), color = "black", size = 1, alpha = 0.7) +
+      geom_line(aes(y = Theoretical), color = "red", size = 1) +
+      facet_wrap(~Distribution, scales = "free") +
+      scale_x_log10() +
+      labs(
+        title = paste("Empirical vs Theoretical CDFs -", label),
+        x = paste("Claim Severity (log scale)", sprintf("(n = %d)", n)),
+        y = "CDF"
+      )+
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        strip.text = element_text(size = 14)
+      )
+    
+    print(p_lp)
+    readline("\n[Press ENTER to view GOF and store results...]")
+    
+    #estimated parameters table
+    param_table <- data.frame(
+      Distribution = dist_names,
+      Param1_Name = c("meanlog", "shape", "shape"),
+      Param1_Value = c(fit_lnorm$estimate["meanlog"], fit_gamma$estimate["shape"], fit_pareto$estimate["shape"]),
+      Param2_Name = c("sdlog", "rate", "scale"),
+      Param2_Value = c(fit_lnorm$estimate["sdlog"], fit_gamma$estimate["rate"], fit_pareto$estimate["scale"])
+    )
+    print(param_table)
+    
+    #gof calculation and results
+    ecdf_vals <- ecdf(x)(data_sorted)
+    mse_vals <- c(
+      mean((ecdf_vals - plnorm(data_sorted, meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"]))^2),
+      mean((ecdf_vals - pgamma(data_sorted, shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"]))^2),
+      mean((ecdf_vals - ppareto(data_sorted, shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"]))^2)
+    )
+    
+    ks_vals <- c(
+      ks.test(x, "plnorm", meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"])$p.value,
+      ks.test(x, "pgamma", shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"])$p.value,
+      ks.test(x, "ppareto", shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"])$p.value
+    )
+    
+    ks_stats <- c(
+      ks.test(x, "plnorm", meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"])$statistic,
+      ks.test(x, "pgamma", shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"])$statistic,
+      ks.test(x, "ppareto", shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"])$statistic
+    )
+    
+    ad_vals <- c(
+      ad.test(plnorm(x, meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"]))$p.value,
+      ad.test(pgamma(x, shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"]))$p.value,
+      ad.test(ppareto(x, shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"]))$p.value
+    )
+    
+    ad_stats <- c(
+      ad.test(plnorm(x, meanlog = fit_lnorm$estimate["meanlog"], sdlog = fit_lnorm$estimate["sdlog"]))$statistic,
+      ad.test(pgamma(x, shape = fit_gamma$estimate["shape"], rate = fit_gamma$estimate["rate"]))$statistic,
+      ad.test(ppareto(x, shape = fit_pareto$estimate["shape"], scale = fit_pareto$estimate["scale"]))$statistic
+    )
+    
+    gof_list <- list(
+      gofstat(fit_lnorm),
+      gofstat(fit_gamma),
+      gofstat(fit_pareto)
+    )
+    
+    gof_table <- data.frame(
+      Distribution = dist_names,
+      KS_stat = round(ks_stats, 4),
+      KS_pval = ks_vals,
+      AD_stat = round(ad_stats, 4),
+      AD_pval = ad_vals,
+      MSE = round(mse_vals, 6),
+      AIC = sapply(gof_list, function(g) g$aic),
+      BIC = sapply(gof_list, function(g) g$bic)
+    )
+    
+    cat("\nGoodness-of-Fit Table -", label, "\n")
+    print(gof_table)
+    
+    metrics <- c("KS_stat", "MSE", "AD_stat", "AIC", "BIC")
+    winners <- sapply(metrics, function(metric) {
+      gof_table$Distribution[which.min(gof_table[[metric]])]
+    })
+    
+    winner_counts <- table(winners)
+    best_fit <- names(which.max(winner_counts))
+    best_count <- max(winner_counts)
+    
+    cat("\nRecommended Distribution:", best_fit,
+        sprintf(" (%d out of %d criteria)\n", best_count, length(metrics)))
+    
+    winner_row <- param_table[param_table$Distribution == best_fit, ]
+    winner_params_df <- rbind(winner_params_df, data.frame(
+      Class = label,
+      Distribution = best_fit,
+      Param1_Name = as.character(winner_row$Param1_Name),
+      Param1_Value = round(winner_row$Param1_Value, 4),
+      Param2_Name = as.character(winner_row$Param2_Name),
+      Param2_Value = round(winner_row$Param2_Value, 4),
+      stringsAsFactors = FALSE
+    ))
+    
+    readline(prompt = "\n[Press ENTER to continue to next dataset...]\n")
+  }
+  
+  
+  return(list(
+    Winners = winner_params_df,
+    Lognormal_Params = lognormal_params_df
+  ))
+}
+
+size_params <- view_fits_interactive(size_list)
+lognormal_df <- size_params$Lognormal_Params
+
+#==================== FREQUENCY FITTING=========================================
+
+
+#frequency model fitting function
+view_freq_fits_interactive <- function(freq_list) {
+  freq_params_df <- data.frame()
+  for (var_name in names(freq_list)) {
+    label <- freq_list[[var_name]]
+    cat("\n=== Processing:", label, "===\n")
+    df <- get(var_name, envir = parent.frame())
+    names(df) <- c("tenure", "freq")
+    
+    
+    #fit zip and b glm
+    nb_model <- glm.nb(freq ~ 1 + offset(log(tenure)), data = df)
+    zip_model <- zeroinfl(freq ~ 1 | 1, offset = log(tenure), dist = "poisson", data = df)
+    
+
+    max_claims <- max(df$freq)
+    x_vals <- 0:max_claims
+    
+    #estimated parameter extraction
+    nb_mu <- exp(coef(nb_model))
+    nb_theta <- nb_model$theta
+    zip_mu <- exp(coef(zip_model)["count_(Intercept)"])
+    zip_pi <- plogis(coef(zip_model)["zero_(Intercept)"])
+    
+    #dummy df for saving each estimated parameters in each subclass
+    freq_params_df <- rbind(freq_params_df, data.frame(
+      Class = label,
+      Intercept = round(coef(nb_model), 4),
+      Mean = round(nb_mu, 4),
+      Dispersion = round(nb_theta, 4),
+      stringsAsFactors = FALSE
+    ))
+    
+    fit_data <- data.frame(
+      x = x_vals,
+      Observed = as.numeric(table(factor(df$freq, levels = x_vals)))
+    )
+    
+    #normalise to probabilities
+    fit_data$Observed <- fit_data$Observed / sum(fit_data$Observed)
+    fit_data$ZIP <- zip_pi * (x_vals == 0) + (1 - zip_pi) * dpois(x_vals, lambda = zip_mu)
+    fit_data$NegBin <- dnbinom(x_vals, mu = nb_mu, size = nb_theta)
+    
+    fit_long <- reshape2::melt(fit_data, id.vars = "x", variable.name = "Source", value.name = "Probability")
+    
+    model_colors <- c("Observed" = "black", "ZIP" = "blue", "NegBin" = "darkgreen")
+    
+    #empirical vs fitted pmf plotting
+    p <- ggplot(fit_long, aes(x = x, y = Probability, fill = Source)) +
+      geom_col(data = subset(fit_long, Source == "Observed"),
+               aes(fill = "Observed"), color = "black", width = 0.7, alpha = 0.5) +
+      geom_col(data = subset(fit_long, Source != "Observed"),
+               position = "dodge", width = 0.6, alpha = 0.5) +
+      scale_fill_manual(values = model_colors) +
+      coord_cartesian(xlim = c(0, 10)) +
+      labs(
+        title = paste("Observed vs Fitted Probabilities -", label),
+        x = "Number of Claims",
+        y = "Probability",
+        fill = "Model"
+      ) +
+      theme_minimal(base_size = 16) +  
+      theme(
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 18),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14)
+      )
+    
+    print(p)
+    
+    #estimated parameter tables
+    param_table <- data.frame(
+      Model = c("Zero-Inflated Poisson", "Negative Binomial"),
+      Intercept = c(
+        round(coef(zip_model)["count_(Intercept)"], 4),
+        round(coef(nb_model), 4)
+      ),
+      Mean = c(round(zip_mu, 4), round(nb_mu, 4)),
+      Dispersion = c(NA, round(nb_theta, 4)),
+      Zero_Prob = c(round(zip_pi, 4), NA)
+    )
+    
+    #gof table
+    gof_table <- data.frame(
+      Model = c("Zero-Inflated Poisson", "Negative Binomial"),
+      AIC = c(AIC(zip_model), AIC(nb_model)),
+      BIC = c(BIC(zip_model), BIC(nb_model))
+    )
+    
+    chisq_test_zip <- sum(residuals(zip_model, type = "pearson")^2)
+    chisq_test_nb <- sum(residuals(nb_model, type = "pearson")^2)
+    df_zip <- df.residual(zip_model)
+    df_nb <- df.residual(nb_model)
+    crit_zip <- round(qchisq(0.95, df_zip), 2)
+    crit_nb <- round(qchisq(0.95, df_nb), 2)
+    
+    test_table <- data.frame(
+      Model = c("Zero-Inflated Poisson", "Negative Binomial"),
+      Pearson_ChiSq = c(round(chisq_test_zip, 2), round(chisq_test_nb, 2)),
+      DF = c(df_zip, df_nb),
+      Crit_ChiSq_0.95 = c(crit_zip, crit_nb),
+      p_value = c(
+        round(1 - pchisq(chisq_test_zip, df_zip), 4),
+        round(1 - pchisq(chisq_test_nb, df_nb), 4)
+      )
+    )
+    
+    cat("\nParameter Estimates:\n")
+    print(param_table, row.names = FALSE)
+    
+    cat("\nGoodness-of-Fit Statistics:\n")
+    print(gof_table, row.names = FALSE)
+    
+    cat("\nFormal Pearson Chi-Square Goodness-of-Fit Test:\n")
+    print(test_table, row.names = FALSE)
+    
+    readline(prompt = "\n[Press ENTER to continue to next dataset...]\n")
+  }
+  return(freq_params_df)
+}
+
+
+freq_params_df <- view_freq_fits_interactive(freq_list)
+
+#==================== BETA EXPANSION (ALL FUNCTIONS)============================
+
+log_beta_pdf <- function(x, shape1, shape2) {
+  dbeta(x, shape1, shape2, log = TRUE)
+}
+
+#beta mle
+fit_beta_fitdist <- function(x, weights = NULL) {
+  if (!is.null(weights)) {
+    weights <- weights / sum(weights)
+    x <- sample(x, size = length(x), replace = TRUE, prob = weights)
+  }
+  # Calculate mean and variance
+  x_mean <- mean(x)
+  x_var <- var(x)
+  # Compute method of moments estimates
+  shape1_start <- ((x_mean * (1 - x_mean) / x_var) - 1) * x_mean
+  shape2_start <- ((x_mean * (1 - x_mean) / x_var) - 1) * (1 - x_mean)
+  # Ensure starting values are positive
+  shape1_start <- max(shape1_start, 0.1)
+  shape2_start <- max(shape2_start, 0.1)
+  # Fit the Beta distribution
+  fit <- try(fitdist(x, "beta", method = "mle",
+                     start = list(shape1 = shape1_start, shape2 = shape2_start),
+                     lower = c(0.001, 0.001)),
+             silent = TRUE)
+  if (inherits(fit, "try-error")) {
+    warning("fitdist failed; returning NA for shape parameters.")
+    return(list(shape1 = NA, shape2 = NA))
+  }
+  return(list(shape1 = fit$estimate["shape1"], shape2 = fit$estimate["shape2"]))
+}
+
+#log-sum-exp helper
+logSumExp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+#beta mixture
+fit_beta_mixture_fitdistrplus <- function(data, K, max_iter = 100, tol = 1e-6) {
+  N <- length(data)
+  resp <- matrix(runif(N * K), nrow = N, ncol = K)
+  resp <- resp / rowSums(resp)
+  
+  weights <- colMeans(resp)
+  shapes <- lapply(1:K, function(k) fit_beta_fitdist(data))
+  loglik_old <- -Inf
+  
+  for (i in 1:max_iter) {
+    log_probs <- sapply(1:K, function(k) {
+      log(weights[k]) + log_beta_pdf(data, shapes[[k]]$shape1, shapes[[k]]$shape2)
+    })
+    log_sum <- apply(log_probs, 1, logSumExp)
+    loglik <- sum(log_sum)
+    
+    resp <- exp(log_probs - log_sum)
+    weights <- colMeans(resp)
+    
+    for (k in 1:K) {
+      shapes[[k]] <- fit_beta_fitdist(data, weights = resp[, k])
+    }
+    
+    if (abs(loglik - loglik_old) < tol) break
+    loglik_old <- loglik
+  }
+  
+  n_params <- 3 * K - 1
+  aic <- -2 * loglik + 2 * n_params
+  bic <- -2 * loglik + log(N) * n_params
+  
+  return(list(K = K, logLik = loglik, AIC = aic, BIC = bic, weights = weights, shapes = shapes))
+}
+
+#beta 1-inflated
+fit_beta_1inflated_fitdistrplus <- function(data) {
+  # Separate data
+  is_1 <- data == 1
+  is_beta <- data < 1
+  x_beta <- data[is_beta]
+  N <- length(data)
+  
+  # Fit beta part using fitdist
+  beta_fit <- tryCatch(
+    fitdist(x_beta, "beta", method = "mle"),
+    error = function(e) NA
+  )
+  
+  if (inherits(beta_fit, "try-error") || any(is.na(beta_fit$estimate))) {
+    stop("Beta fit failed in 1-inflated beta estimation.")
+  }
+  
+  alpha <- beta_fit$estimate["shape1"]
+  beta  <- beta_fit$estimate["shape2"]
+  
+  # Define log-likelihood function for 1-inflated beta
+  loglik_1inflated_beta <- function(p1) {
+    if (p1 <= 0 || p1 >= 1) return(-Inf)
+    ll_1 <- sum(log(p1))  # for exact 1s
+    ll_beta <- sum(log(1 - p1) + dbeta(x_beta, alpha, beta, log = TRUE))
+    return(-(ll_1 + ll_beta))  # negative log-likelihood for minimization
+  }
+  
+  # Optimize only over p1
+  fit_mle <- optim(par = 0.1, fn = loglik_1inflated_beta,
+                   method = "L-BFGS-B", lower = 1e-6, upper = 1 - 1e-6)
+  
+  p1 <- fit_mle$par
+  logLik <- -(fit_mle$value)
+  
+  # Compute AIC and BIC
+  n_params <- 3  # p1, shape1, shape2
+  aic <- -2 * logLik + 2 * n_params
+  bic <- -2 * logLik + log(N) * n_params
+  
+  return(list(
+    logLik = logLik,
+    AIC = aic,
+    BIC = bic,
+    p1 = p1,
+    shape1 = alpha,
+    shape2 = beta
+  ))
+}
+
+#beta mix with 1-inflated
+fit_beta_mixture_1inflated_fitdistrplus <- function(data, K = 2, max_iter = 100, tol = 1e-6) {
+  N <- length(data)
+  is_1 <- data == 1
+  is_beta <- data < 1
+  
+  # Scale beta values to avoid boundary issues
+  data[is_beta] <- pmin(pmax(data[is_beta], 1e-6), 1 - 1e-6)
+  
+  # Initialize responsibilities and weights
+  resp_beta <- matrix(runif(sum(is_beta) * K), nrow = sum(is_beta), ncol = K)
+  resp_beta <- resp_beta / rowSums(resp_beta)
+  
+  weights <- colMeans(resp_beta)
+  shapes <- lapply(1:K, function(k) fit_beta_fitdist(data[is_beta]))
+  
+  # Initial p1 from data
+  p1 <- mean(is_1)
+  loglik_old <- -Inf
+  
+  for (i in 1:max_iter) {
+    # E-step with proper scaling
+    log_probs <- sapply(1:K, function(k) {
+      log((1 - p1) * weights[k]) + dbeta(data[is_beta], shapes[[k]]$shape1, shapes[[k]]$shape2, log = TRUE)
+    })
+    
+    log_sum <- apply(log_probs, 1, logSumExp)
+    loglik_beta <- sum(log_sum)
+    resp_beta <- exp(log_probs - log_sum)
+    weights <- colMeans(resp_beta)
+    
+    # Update shape parameters with weights
+    for (k in 1:K) {
+      shapes[[k]] <- fit_beta_fitdist(data[is_beta], weights = resp_beta[, k])
+    }
+    
+    # M-step for p1
+    p1 <- mean(is_1)
+    
+    # Total log-likelihood (1s + beta)
+    loglik_1 <- sum(is_1) * log(p1)
+    loglik_total <- loglik_beta + loglik_1
+    
+    if (abs(loglik_total - loglik_old) < tol) break
+    loglik_old <- loglik_total
+  }
+  
+  # Compute mixture density
+  x_vals <- seq(1e-6, 1 - 1e-6, length.out = 1000)
+  mixture_density <- numeric(length(x_vals))
+  for (k in 1:K) {
+    mixture_density <- mixture_density + weights[k] * dbeta(x_vals, shapes[[k]]$shape1, shapes[[k]]$shape2)
+  }
+  mixture_density <- (1 - p1) * mixture_density
+  
+  n_params <- 3 * K - 1 + 1  # 3 per component, -1 for sum weights, +1 for p1
+  aic <- -2 * loglik_total + 2 * n_params
+  bic <- -2 * loglik_total + log(N) * n_params
+  
+  return(list(
+    K = K,
+    logLik = loglik_total,
+    AIC = aic,
+    BIC = bic,
+    p1 = p1,
+    weights = weights,
+    shapes = shapes,
+    mix_density = mixture_density,
+    x_vals = x_vals
+  ))
+}
+
+#risk share model fitting main function
+view_beta_fits_interactive <- function(rs_list) {
+  set.seed(3003)
+  #table to save estimated parameters
+  results_df <- data.frame()
+  for (var_name in names(rs_list)) {
+    label <- rs_list[[var_name]]
+    cat("\n=== Processing:", label, "===\n")
+    x <- get(var_name, envir = parent.frame())
+    x <- x[!is.na(x)]
+    
+    x_beta_mle <- pmin(pmax(x, 1e-6), 1 - 1e-6)
+    x_beta_mix <- if (var_name %in% c("ah_deductible_rs")) pmax(x, 1e-6) else x_beta_mle
+    
+    #standard beta mle
+    beta_mle <- tryCatch(
+      fitdist(x_beta_mle, "beta", method = "mle"),
+      error = function(e) NA
+    )
+    
+    #beta mix or 1-inflated for ah deductible
+    is_inflated <- var_name %in% c("ah_deductible_rs")
+    if (is_inflated) {
+      mix_fit <- fit_beta_mixture_1inflated_fitdistrplus(x_beta_mix, K = 2)
+    } else {
+      mix_fit <- fit_beta_mixture_fitdistrplus(x_beta_mix, K = 2)
+    }
+    #store estimated parameters
+    if (is_inflated) {
+      results_df <- rbind(results_df, data.frame(
+        Class = label,
+        Dist = "1-Inflated Beta Mixture",
+        shape1_1 = mix_fit$shapes[[1]]$shape1,
+        shape2_1 = mix_fit$shapes[[1]]$shape2,
+        weight1 = mix_fit$weights[1],
+        shape1_2 = mix_fit$shapes[[2]]$shape1,
+        shape2_2 = mix_fit$shapes[[2]]$shape2,
+        weight2 = mix_fit$weights[2],
+        p1 = mix_fit$p1
+      ))
+    } else {
+      results_df <- rbind(results_df, data.frame(
+        Class = label,
+        Dist = "Beta Mixture (K=2)",
+        shape1_1 = mix_fit$shapes[[1]]$shape1,
+        shape2_1 = mix_fit$shapes[[1]]$shape2,
+        weight1 = mix_fit$weights[1],
+        shape1_2 = mix_fit$shapes[[2]]$shape1,
+        shape2_2 = mix_fit$shapes[[2]]$shape2,
+        weight2 = mix_fit$weights[2],
+        p1 = NA
+      ))
+    }
+    
+    #plot historam with fitted densities
+    hist(x, breaks = 50, probability = TRUE,
+         main = paste("Beta Mixture Fits -", label),
+         xlab = "Risk Share",
+         cex.main = 1.6,     
+         cex.lab = 1.4,      
+         cex.axis = 1.2      #
+    )
+    if (is_inflated) {
+      segments(x0 = 1, y0 = 0, x1 = 1, y1 = 35, col = "darkred", lwd = 3, lty = 1)
+      
+      points(x = 1, y = 35, pch = 21, bg = "darkred", col = "black", cex = 1.5)
+    }
+    x_vals <- seq(1e-4, 0.999, length.out = 1000)
+    
+    if (!inherits(beta_mle, "try-error") && !any(is.na(beta_mle$estimate))) {
+      lines(x_vals, dbeta(x_vals, beta_mle$estimate["shape1"], beta_mle$estimate["shape2"]),
+            col = "blue", lwd = 2, lty = 2)
+    }
+    
+    mix_density <- if (is_inflated) {
+      rowSums(sapply(1:2, function(k) {
+        (1 - mix_fit$p1) * mix_fit$weights[k] * dbeta(x_vals, mix_fit$shapes[[k]]$shape1, mix_fit$shapes[[k]]$shape2)
+      }))
+    } else {
+      rowSums(sapply(1:2, function(k) {
+        mix_fit$weights[k] * dbeta(x_vals, mix_fit$shapes[[k]]$shape1, mix_fit$shapes[[k]]$shape2)
+      }))
+    }
+    
+    lines(x_vals, mix_density, col = "red", lwd = 2)
+    
+    legend("topright",
+           legend = c("Beta MLE", 
+                      if (is_inflated) "1-Inflated Beta Mixture" else "Beta Mixture"),
+           col = c("blue", "red"),
+           lty = c(2, 1), lwd = 2, bty = "n", inset = c(0.075, 0),
+           cex = 1.3
+    )
+    
+    readline("\n[Press ENTER to view detailed mixture components...]\n")
+    
+    #plot each component of beta mixture
+    x_vals_plot2 <- seq(1e-4, 0.9995, length.out = 1200)
+    component_df <- data.frame(x = x_vals_plot2)
+    
+    if (is_inflated) {
+      component_df$Mix1 <- (1 - mix_fit$p1) * mix_fit$weights[1] *
+        dbeta(x_vals_plot2, mix_fit$shapes[[1]]$shape1, mix_fit$shapes[[1]]$shape2)
+      component_df$Mix2 <- (1 - mix_fit$p1) * mix_fit$weights[2] *
+        dbeta(x_vals_plot2, mix_fit$shapes[[2]]$shape1, mix_fit$shapes[[2]]$shape2)
+    } else {
+      component_df$Mix1 <- mix_fit$weights[1] *
+        dbeta(x_vals_plot2, mix_fit$shapes[[1]]$shape1, mix_fit$shapes[[1]]$shape2)
+      component_df$Mix2 <- mix_fit$weights[2] *
+        dbeta(x_vals_plot2, mix_fit$shapes[[2]]$shape1, mix_fit$shapes[[2]]$shape2)
+    }
+    
+    long_df <- melt(component_df, id.vars = "x", variable.name = "Component", value.name = "Density")
+    long_df_filtered <- subset(long_df, Component %in% c("Mix1", "Mix2"))
+    
+    mix1_weight <- round(mix_fit$weights[1], 3)
+    mix2_weight <- round(mix_fit$weights[2], 3)
+    
+
+    legend_labels <- c(
+      paste0("Mix1 (w = ", mix1_weight, ")"),
+      paste0("Mix2 (w = ", mix2_weight, ")")
+    )
+    
+
+    long_df_filtered <- subset(long_df, Component %in% c("Mix1", "Mix2"))
+    
+    print(
+      ggplot() +
+        geom_histogram(aes(x = x, y = ..density..), bins = 50,
+                       fill = "gray", color = "white", data = data.frame(x = x)) +
+        geom_line(data = long_df_filtered,
+                  aes(x = x, y = Density, color = Component),
+                  linewidth = 1.2) +
+        scale_color_manual(
+          values = c("Mix1" = "steelblue", "Mix2" = "forestgreen"),
+          labels = legend_labels
+        ) +
+        labs(
+          title = paste("Beta Mixture Components -", label),
+          x = "Risk Share",
+          y = "Density"
+        ) +
+        coord_cartesian(xlim = c(0, 1)) +
+        theme_minimal(base_size = 14) +
+        theme(
+          plot.title = element_text(size = 18, face = "bold"),
+          axis.title = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          legend.position = c(0.95, 0.95),
+          legend.justification = c("right", "top"),
+          legend.background = element_rect(fill = "white", color = "black", size = 0.3),
+          legend.title = element_blank()
+        )
+    )
+    
+    
+    #estimated parameter tables
+    cat("\nParameter Estimates\n")
+    param_table <- if (is_inflated) {
+      data.frame(
+        Model = c("Beta MLE", "1-Inflated Mix 1", "1-Inflated Mix 2"),
+        shape1 = c(beta_mle$estimate["shape1"],
+                   mix_fit$shapes[[1]]$shape1, mix_fit$shapes[[2]]$shape1),
+        shape2 = c(beta_mle$estimate["shape2"],
+                   mix_fit$shapes[[1]]$shape2, mix_fit$shapes[[2]]$shape2),
+        weight = c(NA, round(mix_fit$weights[1], 4), round(mix_fit$weights[2], 4))
+      )
+    } else {
+      data.frame(
+        Model = c("Beta MLE", "Beta Mix 1", "Beta Mix 2"),
+        shape1 = c(beta_mle$estimate["shape1"],
+                   mix_fit$shapes[[1]]$shape1, mix_fit$shapes[[2]]$shape1),
+        shape2 = c(beta_mle$estimate["shape2"],
+                   mix_fit$shapes[[1]]$shape2, mix_fit$shapes[[2]]$shape2),
+        weight = c(NA, round(mix_fit$weights[1], 4), round(mix_fit$weights[2], 4))
+      )
+    }
+    print(param_table, row.names = FALSE)
+    
+    #gof table
+    cat("\nModel Fit (LogLik, AIC, BIC)\n")
+    gof_table <- if (is_inflated) {
+      data.frame(
+        Model = "1-Inflated Beta Mixture",
+        LogLik = mix_fit$logLik,
+        AIC = mix_fit$AIC,
+        BIC = mix_fit$BIC
+      )
+    } else {
+      data.frame(
+        Model = "Beta Mixture (K=2)",
+        LogLik = mix_fit$logLik,
+        AIC = mix_fit$AIC,
+        BIC = mix_fit$BIC
+      )
+    }
+    
+    
+    print(gof_table, row.names = FALSE)
+    if (!is_inflated) {
+      if (!inherits(beta_mle, "try-error") && !is_inflated) {
+        loglik_mle <- as.numeric(logLik(beta_mle))
+        loglik_mix <- mix_fit$logLik
+        
+        LRT_stat <- 2 * (loglik_mix - loglik_mle)
+        df_diff <- 3
+        pval_LRT <- pchisq(LRT_stat, df = df_diff, lower.tail = FALSE)
+        
+        cat(sprintf("\nLikelihood Ratio Test (Beta MLE vs K=2):\n"))
+        cat(sprintf("  LRT statistic: %.3f\n", LRT_stat))
+        cat(sprintf("  Degrees of freedom: %d\n", df_diff))
+        cat(sprintf("  Chi-squared critical value (95%%): %.3f\n", qchisq(0.95, df_diff)))
+        cat(sprintf("  p-value: %.4g\n", pval_LRT))
+        
+        if (pval_LRT < 0.05) {
+          cat("Result: Reject H0 — Mixture K=2 fits significantly better.\n")
+        } else {
+          cat("Result: Fail to reject H0 — Standard Beta is adequate.\n")
+        }
+      }
+    }
+    if (is_inflated) cat("\nNote: AIC/BIC comparison between Beta MLE and 1-Inflated Beta Mixture is not exact due to differing support.\n")
+    readline("\n[Press ENTER to continue to next dataset...]\n")
+  }
+  return(results_df)
+}
+
+results_df <- view_beta_fits_interactive(rs_list)
+
+
+
+#====================SIMULATIONS================================================
+
+#simulation classes list
+simulation_class_list <- list(
+  ah_main_class = "Aviation Hull - Main",
+  ah_deductible_class = "Aviation Hull - Deductible",
+  mh_main_size_class = "Marine Hull - Main",
+  mh_iv_size_class = "Marine Hull - IV"
+)
+
+
+#=====NOTE: These packages below has to be run after are modelling parts are completed
+install.packages("extraDistr")
+install.packages("e1071")
+install.packages("kSamples")
+library(extraDistr)
+library(e1071)
+library(kSamples)
+
+#simultaion function
+simulate_losses_interactive <- function(simulation_class_list, lognormal_df, freq_params_df, results_df, n_sim = 10000, n_policy = 1000) {
+  set.seed(88888)
+  for (var_name in names(simulation_class_list)) {
+    label <- simulation_class_list[[var_name]]
+    cat("\n=== Now simulating:", label, "===\n")
+    
+    #import all distribution parameters
+    log_params <- subset(lognormal_df, Class == label)
+    freq_params <- subset(freq_params_df, Class == label)
+    prop_params <- subset(results_df, Class == label)
+    
+    meanlog <- log_params$meanlog
+    sdlog <- log_params$sdlog
+    
+    size <- freq_params$Mean^2 / (freq_params$Dispersion^2 * freq_params$Mean)
+    mu <- freq_params$Mean
+    
+    market_loss <- numeric(n_sim)
+    syndicate_loss <- numeric(n_sim)
+    
+    for (i in 1:n_sim) {
+      #assign frequency per policy
+      freq <- rnbinom(n_policy, size = size, mu = mu)
+      
+      #simulate claim severty
+      agg_claims <- sapply(freq, function(f) {
+        if (f > 0) sum(rlnorm(f, meanlog, sdlog)) else 0
+      })
+      
+      # Simulate proportions and apply to each policy
+      if (grepl("Inflated", prop_params$Dist)) {
+        p1 <- prop_params$p1
+        prop_draws <- sapply(1:n_policy, function(j) {
+          if (runif(1) < p1) {
+            1
+          } else {
+            w1 <- prop_params$weight1
+            w2 <- prop_params$weight2
+            if (runif(1) < w1 / (w1 + w2)) {
+              rbeta(1, prop_params$shape1_1, prop_params$shape2_1)
+            } else {
+              rbeta(1, prop_params$shape1_2, prop_params$shape2_2)
+            }
+          }
+        })
+      } else {
+        prop_draws <- sapply(1:n_policy, function(j) {
+          if (runif(1) < prop_params$weight1) {
+            rbeta(1, prop_params$shape1_1, prop_params$shape2_1)
+          } else {
+            rbeta(1, prop_params$shape1_2, prop_params$shape2_2)
+          }
+        })
+      }
+      
+
+      syndicate_loss[i] <- sum(agg_claims * prop_draws)
+      market_loss[i] <- sum(agg_claims)
+    }
+    
+  
+    df <- data.frame(
+      MarketLoss = market_loss,
+      SyndicateLoss = syndicate_loss
+    )
+    df_melt <- melt(df)
+    #plot the empirical cdfs of market vs syndicate
+    print(
+      ggplot(df_melt, aes(x = value, fill = variable)) +
+        geom_density(alpha = 0.6, aes(y = ..density..)) +
+        scale_x_log10() +
+        labs(
+          title = paste("Empirical PDF -", label),
+          x = "Loss",
+          y = "Probability Density"
+        ) +
+        theme_minimal(base_size = 16) +  # increase base font size
+        theme(
+          plot.title = element_text(size = 20, face = "bold"),
+          axis.title = element_text(size = 18),
+          axis.text = element_text(size = 16),
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 14),
+          legend.position = c(0.85, 0.5),  # inside plot (middle-right)
+          legend.background = element_rect(fill = "white", color = "gray70", linewidth = 0.3)
+        )
+    )
+    
+    #QQ plot comparing the shape of the tails
+    log_market <- log10(market_loss)
+    log_synd <- log10(syndicate_loss)
+    
+    prob_seq <- seq(0, 1, length.out = length(log_market))
+    q_market_log <- quantile(log_market, probs = prob_seq)
+    q_synd_log <- quantile(log_synd, probs = prob_seq)
+    
+    qq_df <- data.frame(
+      RefQuantile = scale(q_market_log),
+      TargetQuantile = scale(q_synd_log)
+    )
+    
+    print(
+      ggplot(qq_df, aes(x = RefQuantile, y = TargetQuantile)) +
+        geom_point(alpha = 0.5) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+        geom_vline(
+          xintercept = quantile(qq_df$RefQuantile, 0.99),
+          linetype = "dashed", color = "red", linewidth = 1
+        ) +
+        annotate(
+          "text",
+          x = max(qq_df$RefQuantile),
+          y = min(qq_df$TargetQuantile),
+          label = "Red dashed line: 99th percentile",
+          hjust = 1, vjust = 0,
+          color = "red", size = 5.5  # increased annotation label size
+        ) +
+        labs(
+          title = paste("QQ Plot (Log Quantiles, Market as Reference) -", label),
+          x = "log10(Market Loss Quantiles)",
+          y = "log10(Syndicate Loss Quantiles)"
+        ) +
+        theme_minimal(base_size = 16) +  # increased base text size
+        theme(
+          plot.title = element_text(size = 20, face = "bold"),
+          axis.title = element_text(size = 18),
+          axis.text = element_text(size = 16)
+        )
+    )
+
+    #QQ plot comparing the shape of the tails top 5%
+    qq_df_filtered <- qq_df[prob_seq >= 0.95, ]
+
+    vline_99 <- quantile(qq_df$RefQuantile, 0.99)
+
+    
+    print(
+      ggplot(qq_df_filtered, aes(x = RefQuantile, y = TargetQuantile)) +
+        geom_point(alpha = 0.5) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+        geom_vline(xintercept = vline_99, linetype = "dashed", color = "red", linewidth = 1) +
+        annotate(
+          "text",
+          x = max(qq_df_filtered$RefQuantile),
+          y = min(qq_df_filtered$TargetQuantile),
+          label = "Red dashed line: 99th percentile",
+          hjust = 1, vjust = 0,
+          color = "red", size = 5
+        ) +
+        labs(
+          title = paste("QQ Plot (Log Quantiles, Market as Reference) -", label),
+          x = "log10(Market Loss Quantiles)",
+          y = "log10(Syndicate Loss Quantiles)"
+          ) +
+        theme_minimal(base_size = 16) +
+        theme(
+          plot.title = element_text(size = 20, face = "bold"),
+          axis.title = element_text(size = 18),
+          axis.text = element_text(size = 16)
+        )
+    )
+    #moments, VaR and ES calculation
+    calc_metrics <- function(loss_vector) {
+      c(
+        Mean = mean(loss_vector),
+        Variance = var(loss_vector),
+        SD = sd(loss_vector),
+        Skewness = skewness(loss_vector, type = 3),
+        Kurtosis = kurtosis(loss_vector, type = 3),
+        VaR = quantile(loss_vector, 0.99),
+        ES_99 = mean(loss_vector[loss_vector > quantile(loss_vector, 0.99)])
+      )
+    }
+    
+    market_metrics <- calc_metrics(market_loss)
+    synd_metrics <- calc_metrics(syndicate_loss)
+    metric_table <- data.frame(
+      Metric = names(market_metrics),
+      Market_Loss = round(as.numeric(market_metrics), 2),
+      Syndicate_Loss = round(as.numeric(synd_metrics), 2)
+    )
+    
+    cat("\n--- Comparative Metrics Table ---\n")
+    print(metric_table)
+    
+    #formal tests
+    cat("\n--- Distributional Tests ---\n")
+    ks_result <- ks.test(scale(market_loss), scale(syndicate_loss))
+    cat(sprintf("Kolmogorov-Smirnov D = %.4f, p = %.4g\n", ks_result$statistic, ks_result$p.value))
+    
+    ad_result <- kSamples::ad.test(scale(market_loss), scale(syndicate_loss), method = "asymptotic")
+    ad_stat <- ad_result$ad[1, 2]
+    ad_pval <- ad_result$ad[1, 3]
+    cat(sprintf("Anderson-Darling A = %.4f, p = %.4g\n", ad_stat, ad_pval))
+    
+
+    market_tail <- market_loss[market_loss > quantile(market_loss, 0.99)]
+    synd_tail <- syndicate_loss[syndicate_loss > quantile(syndicate_loss, 0.99)]
+    
+    #formal test on tail
+    tail_ks <- ks.test(market_tail, synd_tail)
+    cat(sprintf("\nTail KS Test (99%%+) D = %.4f, p = %.4g\n", tail_ks$statistic, tail_ks$p.value))
+    
+    readline("[ENTER → Next simulation class]\n")
+  }
+}
+
+simulate_losses_interactive(
+  simulation_class_list,
+  lognormal_df,
+  freq_params_df,
+  results_df
+)
+
+
+#==================== OTHER TABLES =============================================
+#risk share histograms
+hist(mh_rs, breaks = 70, prob = TRUE,
+     main = "Marine Hull", xlab = "Risk Share",
+     cex.lab = 1.1,               
+     cex.axis = 1.2,              
+     cex.main = 1.5,
+     ylim = c(0,23))
+hist(ah_rs, breaks = 70, prob = TRUE,
+     main = "Aviation Hull", xlab = "Risk Share",
+     cex.lab = 1.1,               
+     cex.axis = 1.2,              
+     cex.main = 1.5,ylim = c(0,23))
+hist(ah_deductible_rs, breaks = 50, prob = TRUE,
+     main = "Aviation Hull - Deductible", xlab = "Risk Share",
+     cex.lab = 1.1,               
+     cex.axis = 1.2,              
+     cex.main = 1.5)
+hist(ah_deductible_rs[ah_deductible_rs !=1], breaks = 50, prob = TRUE,
+     main = "Aviation Hull - Deductible (0,1)", xlab = "Risk Share",
+     cex.lab = 1.1,               
+     cex.axis = 1.2,              
+     cex.main = 1.5)
+
+#violin plot
+violin_data <- data.frame(
+  marketloss = c(ah_main_size, ah_deductible_size, mh_main_size, mh_iv_size),
+  subclass = factor(c(
+    rep("AH - Main", length(ah_main_size)),
+    rep("AH - Deductible", length(ah_deductible_size)),
+    rep("MH - Main", length(mh_main_size)),
+    rep("MH - IV", length(mh_iv_size))
+  ), levels = c("AH - Main", "AH - Deductible", "MH - Main", "MH - IV"))  # <- set order here
+)
+ggplot(violin_data, aes(x = subclass, y = log10(marketloss))) +
+  geom_violin(fill = "lightblue", trim = FALSE) +
+  labs(
+    title = "Violin Plot of Log10 Claim Severity by Subclass",
+    x = "Subclass",
+    y = "Log10(Claim Severity)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12)
+  )
